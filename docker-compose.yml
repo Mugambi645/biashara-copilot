@@ -1,0 +1,173 @@
+version: "3.9"
+
+networks:
+  biashara-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+  minio_data:
+
+services:
+  # ■■■ Database ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: biashara
+      POSTGRES_USER: biashara
+      POSTGRES_PASSWORD: biashara_secret
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - biashara-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U biashara"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ■■■ Cache ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --requirepass redis_secret
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - biashara-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis_secret", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ■■■ Message Broker ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: biashara
+      RABBITMQ_DEFAULT_PASS: rabbit_secret
+      RABBITMQ_DEFAULT_VHOST: biashara
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      - ./infra/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # Management UI
+    networks:
+      - biashara-net
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # ■■■ Object Storage (S3-compatible) ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio_access
+      MINIO_ROOT_PASSWORD: minio_secret_key
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - biashara-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ■■■ Go Core API ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      APP_ENV: development
+      PORT: 8080
+      DATABASE_URL: postgres://biashara:biashara_secret@postgres:5432/biashara?sslmode=disable
+      REDIS_URL: redis://:redis_secret@redis:6379/0
+      RABBITMQ_URL: amqp://biashara:rabbit_secret@rabbitmq:5672/biashara
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: minio_access
+      S3_SECRET_KEY: minio_secret_key
+      S3_BUCKET: biashara-receipts
+      AI_SERVICE_URL: http://ai-service:8000
+      JWT_SECRET: change_me_in_production_32chars_min
+      ALLOWED_ORIGINS: http://localhost:3000
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - biashara-net
+
+  # ■■■ Python AI Service ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  ai-service:
+    build:
+      context: ./ai-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: 8000
+      RABBITMQ_URL: amqp://biashara:rabbit_secret@rabbitmq:5672/biashara
+      DATABASE_URL: postgres://biashara:biashara_secret@postgres:5432/biashara
+      ACTIVE_PROVIDER: anthropic # anthropic | openai | gemini | huggingface
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      HUGGINGFACE_API_KEY: ${HUGGINGFACE_API_KEY:-}
+      HUGGINGFACE_MODEL: ${HUGGINGFACE_MODEL:-mistralai/Mistral-7B-Instruct-v0.2}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - biashara-net
+
+  # ■■■ Go Background Worker ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://biashara:biashara_secret@postgres:5432/biashara?sslmode=disable
+      REDIS_URL: redis://:redis_secret@redis:6379/0
+      RABBITMQ_URL: amqp://biashara:rabbit_secret@rabbitmq:5672/biashara
+      AI_SERVICE_URL: http://ai-service:8000
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: minio_access
+      S3_SECRET_KEY: minio_secret_key
+      S3_BUCKET: biashara-receipts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - biashara-net
